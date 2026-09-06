@@ -811,7 +811,9 @@ Cosockets Not Available Everywhere
 
 Due to internal limitations in the Nginx core, the cosocket API is disabled in the following contexts: [set_by_lua*](#set_by_lua), [log_by_lua*](#log_by_lua), [header_filter_by_lua*](#header_filter_by_lua), and [body_filter_by_lua](#body_filter_by_lua).
 
-The cosockets are currently also disabled in the [init_by_lua*](#init_by_lua) and [init_worker_by_lua*](#init_worker_by_lua) directive contexts but we may add support for these contexts in the future because there is no limitation in the Nginx core (or the limitation might be worked around).
+The cosockets are currently also disabled in the [init_by_lua*](#init_by_lua) directive contexts but we may add support for these contexts in the future because there is no limitation in the Nginx core (or the limitation might be worked around).
+
+Cosockets **are now supported** in the [init_worker_by_lua*](#init_worker_by_lua_block) directive contexts. When a cosocket operation yields (e.g. during a `connect` or `receive` call), the module runs a lightweight event pump that drives the event loop until the operation completes or the [lua_init_worker_timeout](#lua_init_worker_timeout) budget is exhausted. Note that `ngx.timer.at` callbacks registered in `init_worker_by_lua*` are deferred until the init code finishes running.
 
 There exists a workaround, however, when the original context does *not* need to wait for the cosocket results. That is, creating a zero-delay timer via the [ngx.timer.at](#ngxtimerat) API and do the cosocket results in the timer handler, which runs asynchronously as to the original context creating the timer.
 
@@ -1190,6 +1192,8 @@ Directives
 * [lua_socket_pool_size](#lua_socket_pool_size)
 * [lua_socket_keepalive_timeout](#lua_socket_keepalive_timeout)
 * [lua_socket_log_errors](#lua_socket_log_errors)
+* [lua_init_worker_timeout](#lua_init_worker_timeout)
+* [lua_init_worker_abort_on_error](#lua_init_worker_abort_on_error)
 * [lua_ssl_ciphers](#lua_ssl_ciphers)
 * [lua_ssl_crl](#lua_ssl_crl)
 * [lua_ssl_protocols](#lua_ssl_protocols)
@@ -1673,6 +1677,10 @@ This hook is often used to create per-worker reoccurring timers (via the [ngx.ti
 This directive was first introduced in the `v0.9.17` release.
 
 This hook no longer runs in the cache manager and cache loader processes since the `v0.10.12` release.
+
+Starting from this version, cosocket operations (e.g. `ngx.socket.tcp`, `ngx.socket.udp`, `ngx.sleep`, `ngx.semaphore`, `ngx.thread.spawn`) are supported in this context. When such an operation yields, the module runs a lightweight event pump to drive the Nginx event loop until the operation completes. Use [lua_init_worker_timeout](#lua_init_worker_timeout) to bound how long the init code can block worker startup, and [lua_init_worker_abort_on_error](#lua_init_worker_abort_on_error) to control whether a Lua runtime error should abort the worker process.
+
+Note that `ngx.timer.at` callbacks registered during this hook are deferred: they will not run until the init code finishes. This preserves the implicit ordering guarantee that timer callbacks registered in `init_worker_by_lua*` execute only after the init code completes.
 
 [Back to TOC](#directives)
 
@@ -3577,6 +3585,49 @@ This directive was first introduced in the `v0.5.13` release.
 
 [Back to TOC](#directives)
 
+lua_init_worker_timeout
+-----------------------
+
+**syntax:** *lua_init_worker_timeout &lt;time&gt;*
+
+**default:** *lua_init_worker_timeout 0*
+
+**context:** *http*
+
+Sets the maximum wall-clock time that `init_worker_by_lua*` code is allowed to block worker startup. When the timeout is reached, the Lua code is forcibly aborted and the worker continues starting normally (the error is logged at the `ERR` level).
+
+The default value `0` means no timeout: a hung remote connection will block the worker indefinitely.
+
+The `<time>` argument can be an integer with an optional time unit, like `s` (second) or `ms` (millisecond). The default time unit is `s`. **Note: a bare number means seconds** — to specify milliseconds, you must write the `ms` suffix (e.g. `500ms`).
+
+It is strongly recommended to set this directive to a bounded value whenever cosockets are used in `init_worker_by_lua*`, to prevent a hung backend from indefinitely blocking worker startup.
+
+This directive was first introduced in this release.
+
+[Back to TOC](#directives)
+
+lua_init_worker_abort_on_error
+-------------------------------
+
+**syntax:** *lua_init_worker_abort_on_error on|off*
+
+**default:** *lua_init_worker_abort_on_error off*
+
+**context:** *http*
+
+When set to `on`, a Lua runtime error in `init_worker_by_lua*` causes the worker process to exit with code 2 immediately (the Nginx master will restart it). When `off` (the default), the error is logged but the worker starts normally.
+
+Note the following limitations:
+
+* This only covers errors that occur **before the first yield** (i.e. synchronous errors). Errors during a yielded cosocket operation are logged but do not trigger the abort.
+* When `on` is set, `exit_worker_by_lua*` is **not executed** — the worker exits via `exit(2)`, which bypasses the graceful shutdown hooks.
+* This directive cannot replace `lua_init_worker_timeout`: it only handles Lua runtime errors, not hung I/O operations.
+* If the error is reproducible, setting `on` will cause a crash loop (the master keeps restarting a worker that immediately errors out).
+
+This directive was first introduced in this release.
+
+[Back to TOC](#directives)
+
 lua_ssl_ciphers
 ---------------
 
@@ -4555,7 +4606,7 @@ ngx.location.capture
 
 **syntax:** *res = ngx.location.capture(uri, options?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Issues a synchronous but still non-blocking *Nginx Subrequest* using `uri`.
 
@@ -4877,7 +4928,7 @@ ngx.location.capture_multi
 
 **syntax:** *res1, res2, ... = ngx.location.capture_multi({ {uri, options?}, {uri, options?}, ... })*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Just like [ngx.location.capture](#ngxlocationcapture), but supports multiple subrequests running in parallel.
 
@@ -4969,7 +5020,7 @@ ngx.header.HEADER
 
 **syntax:** *value = ngx.header.HEADER*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
 
 Set, add to, or clear the current request's `HEADER` response header that is to be sent.
 
@@ -5517,7 +5568,7 @@ ngx.req.get_post_args
 
 **syntax:** *args, err = ngx.req.get_post_args(max_args?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
 
 Returns a Lua table holding all the current request POST query arguments (of the MIME type `application/x-www-form-urlencoded`). Call [ngx.req.read_body](#ngxreqread_body) to read the request body first or turn on the [lua_need_request_body](#lua_need_request_body) directive to avoid errors.
 
@@ -5785,7 +5836,7 @@ ngx.req.read_body
 
 **syntax:** *ngx.req.read_body()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Reads the client request body synchronously without blocking the Nginx event loop.
 
@@ -5817,7 +5868,7 @@ ngx.req.discard_body
 
 **syntax:** *ngx.req.discard_body()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly discard the request body, i.e., read the data on the connection and throw it away immediately (without using the request body by any means).
 
@@ -5836,7 +5887,7 @@ ngx.req.get_body_data
 
 **syntax:** *data = ngx.req.get_body_data(max_bytes?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, log_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, log_by_lua&#42;*
 
 Retrieves in-memory request body data. It returns a Lua string rather than a Lua table holding all the parsed query arguments. Use the [ngx.req.get_post_args](#ngxreqget_post_args) function instead if a Lua table is required.
 
@@ -5867,7 +5918,7 @@ ngx.req.get_body_file
 
 **syntax:** *file_name = ngx.req.get_body_file()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Retrieves the file name for the in-file request body data. Returns `nil` if the request body has not been read or has been read into memory.
 
@@ -5892,7 +5943,7 @@ ngx.req.set_body_data
 
 **syntax:** *ngx.req.set_body_data(data)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
 
 Set the current request's request body using the in-memory data specified by the `data` argument.
 
@@ -5913,7 +5964,7 @@ ngx.req.set_body_file
 
 **syntax:** *ngx.req.set_body_file(file_name, auto_clean?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
 
 Set the current request's request body using the in-file data specified by the `file_name` argument.
 
@@ -6008,7 +6059,7 @@ ngx.req.socket
 
 **syntax:** *tcpsock, err = ngx.req.socket(raw)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Returns a read-only cosocket object that wraps the downstream connection. Only [receive](#tcpsockreceive), [receiveany](#tcpsockreceiveany) and [receiveuntil](#tcpsockreceiveuntil) methods are supported on this object.
 
@@ -6036,7 +6087,7 @@ ngx.exec
 
 **syntax:** *ngx.exec(uri, args?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Does an internal redirect to `uri` with `args` and is similar to the [echo_exec](http://github.com/openresty/echo-nginx-module#echo_exec) directive of the [echo-nginx-module](http://github.com/openresty/echo-nginx-module).
 
@@ -6104,7 +6155,7 @@ ngx.redirect
 
 **syntax:** *ngx.redirect(uri, status?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Issue an `HTTP 301` or `302` redirection to `uri`.
 
@@ -6197,7 +6248,7 @@ ngx.send_headers
 
 **syntax:** *ok, err = ngx.send_headers()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly send out the response headers.
 
@@ -6226,7 +6277,7 @@ ngx.print
 
 **syntax:** *ok, err = ngx.print(...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Emits arguments concatenated to the HTTP client (as response body). If response headers have not been sent, this function will send headers out first and then output body data.
 
@@ -6268,7 +6319,7 @@ ngx.say
 
 **syntax:** *ok, err = ngx.say(...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Just as [ngx.print](#ngxprint) but also emit a trailing newline.
 
@@ -6296,7 +6347,7 @@ ngx.flush
 
 **syntax:** *ok, err = ngx.flush(wait?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Flushes response output to the client.
 
@@ -6317,7 +6368,7 @@ ngx.exit
 
 **syntax:** *ngx.exit(status)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, ngx.timer.&#42;, balancer_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, ngx.timer.&#42;, balancer_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 When `status >= 200` (i.e., `ngx.HTTP_OK` and above), it will interrupt the execution of the current request and return status code to Nginx.
 
@@ -6373,7 +6424,7 @@ ngx.eof
 
 **syntax:** *ok, err = ngx.eof()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly specify the end of the response output stream. In the case of HTTP 1.1 chunked encoded output, it will just trigger the Nginx core to send out the "last chunk".
 
@@ -6409,7 +6460,7 @@ ngx.sleep
 
 **syntax:** *ngx.sleep(seconds)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Sleeps for the specified seconds without blocking. One can specify time resolution up to 0.001 seconds (i.e., one millisecond).
 
@@ -7911,7 +7962,7 @@ ngx.socket.udp
 
 **syntax:** *udpsock = ngx.socket.udp()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Creates and returns a UDP or datagram-oriented unix domain socket object (also known as one type of the "cosocket" objects). The following methods are supported on this object:
 
@@ -7934,7 +7985,7 @@ udpsock:bind
 ------------
 **syntax:** *ok, err = udpsock:bind(address)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;,ssl_session_fetch_by_lua&#42;,ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;,ssl_session_fetch_by_lua&#42;,ssl_client_hello_by_lua&#42;*
 
 Just like the standard [proxy_bind](http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_bind) directive, this api makes the outgoing connection to a upstream server originate from the specified local IP address.
 
@@ -7967,7 +8018,7 @@ udpsock:setpeername
 
 **syntax:** *ok, err = udpsock:setpeername("unix:/path/to/unix-domain.socket")*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Attempts to connect a UDP socket object to a remote server or to a datagram unix domain socket file. Because the datagram protocol is actually connection-less, this method does not really establish a "connection", but only just set the name of the remote peer for subsequent read/write operations.
 
@@ -8030,7 +8081,7 @@ udpsock:send
 
 **syntax:** *ok, err = udpsock:send(data)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Sends data on the current UDP or datagram unix domain socket object.
 
@@ -8047,7 +8098,7 @@ udpsock:receive
 
 **syntax:** *data, err = udpsock:receive(size?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Receives data from the UDP or datagram unix domain socket object with an optional receive buffer size argument, `size`.
 
@@ -8083,7 +8134,7 @@ udpsock:close
 
 **syntax:** *ok, err = udpsock:close()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Closes the current UDP or datagram unix domain socket. It returns the `1` in case of success and returns `nil` with a string describing the error otherwise.
 
@@ -8098,7 +8149,7 @@ udpsock:settimeout
 
 **syntax:** *udpsock:settimeout(time)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Set the timeout value in milliseconds for subsequent socket operations (like [receive](#udpsockreceive)).
 
@@ -8123,7 +8174,7 @@ ngx.socket.tcp
 
 **syntax:** *tcpsock = ngx.socket.tcp()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Creates and returns a TCP or stream-oriented unix domain socket object (also known as one type of the "cosocket" objects). The following methods are supported on this object:
 
@@ -8175,7 +8226,7 @@ tcpsock:bind
 ------------
 **syntax:** *ok, err = tcpsock:bind(address, port?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;,ssl_session_fetch_by_lua&#42;,ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;,ssl_session_fetch_by_lua&#42;,ssl_client_hello_by_lua&#42;*
 
 Just like the standard [proxy_bind](http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_bind) directive, this api makes the outgoing connection to a upstream server originate from the specified local IP address.
 
@@ -8215,7 +8266,7 @@ tcpsock:connect
 
 **syntax:** *ok, err = tcpsock:connect("unix:/path/to/unix-domain.socket", options_table?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Attempts to connect a TCP socket object to a remote server or to a stream unix domain socket file without blocking.
 
@@ -8336,7 +8387,7 @@ tcpsock:getfd
 
 **syntax:** *fd, err = tcpsock:getfd()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Get the file descriptor of the current tcp socket.
 
@@ -8350,7 +8401,7 @@ tcpsock:setclientcert
 
 **syntax:** *ok, err = tcpsock:setclientcert(cert, pkey)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Set client certificate chain and corresponding private key to the TCP socket object.
 The certificate chain and private key provided will be used later by the [tcpsock:sslhandshake](#tcpsocksslhandshake) method.
@@ -8375,7 +8426,7 @@ tcpsock:settrustedstore
 
 **syntax:** *ok, err = tcpsock:settrustedstore(x509_store)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;*
 
 Set an X509 trusted certificate store on the TCP socket object. The store will be used by the
 [tcpsock:sslhandshake](#tcpsocksslhandshake) method to verify the remote server's certificate, in
@@ -8405,7 +8456,7 @@ tcpsock:sslhandshake
 
 **syntax:** *session, err = tcpsock:sslhandshake(reused_session?, server_name?, ssl_verify?, send_status_req?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Does SSL/TLS handshake on the currently established connection.
 
@@ -8454,7 +8505,7 @@ tcpsock:getsslpointer
 
 **syntax:** *sslpointer, err = tcpsock:getsslpointer()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Retrieves the underlying SSL pointer (SSL_CTX structure) of the cosocket connection.
 
@@ -8469,7 +8520,7 @@ tcpsock:getsslctx
 
 **syntax:** *sslctx, err = tcpsock:getsslctx()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Retrieves the underlying SSL pointer (SSL_CTX structure) of the cosocket connection.
 
@@ -8484,7 +8535,7 @@ tcpsock:getsslsession
 
 **syntax:** *session, err = tcpsock:getsslsession()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Retrieves the SSL session object from the cosocket connection for session resumption purposes.
 
@@ -8499,7 +8550,7 @@ tcpsock:send
 
 **syntax:** *bytes, err = tcpsock:send(data)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Sends data without blocking on the current TCP or Unix Domain Socket connection.
 
@@ -8532,7 +8583,7 @@ tcpsock:receive
 
 **syntax:** *data, err, partial = tcpsock:receive(pattern?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Receives data from the connected socket according to the reading pattern or size.
 
@@ -8575,7 +8626,7 @@ tcpsock:receiveany
 
 **syntax:** *data, err = tcpsock:receiveany(max)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Returns any data received by the connected socket, at most `max` bytes.
 
@@ -8610,7 +8661,7 @@ tcpsock:receiveuntil
 
 **syntax:** *iterator = tcpsock:receiveuntil(pattern, options?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 This method returns an iterator Lua function that can be called to read the data stream until it sees the specified pattern or an error occurs.
 
@@ -8710,7 +8761,7 @@ tcpsock:close
 
 **syntax:** *ok, err = tcpsock:close()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Closes the current TCP or stream unix domain socket. It returns the `1` in case of success and returns `nil` with a string describing the error otherwise.
 
@@ -8727,7 +8778,7 @@ tcpsock:settimeout
 
 **syntax:** *tcpsock:settimeout(time)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Set the timeout value in milliseconds for subsequent socket operations ([connect](#tcpsockconnect), [receive](#tcpsockreceive), and iterators returned from [receiveuntil](#tcpsockreceiveuntil)).
 
@@ -8744,7 +8795,7 @@ tcpsock:settimeouts
 
 **syntax:** *tcpsock:settimeouts(connect_timeout, send_timeout, read_timeout)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Respectively sets the connect, send, and read timeout thresholds (in milliseconds) for subsequent socket
 operations ([connect](#tcpsockconnect), [send](#tcpsocksend), [receive](#tcpsockreceive), and iterators returned from [receiveuntil](#tcpsockreceiveuntil)).
@@ -8764,7 +8815,7 @@ tcpsock:setoption
 
 **syntax:** *ok, err = tcpsock:setoption(option, value?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 This function is added for [LuaSocket](http://w3.impa.br/~diego/software/luasocket/tcp.html) API compatibility, its functionality is implemented `v0.10.18`.
 
@@ -8867,7 +8918,7 @@ tcpsock:setkeepalive
 
 **syntax:** *ok, err = tcpsock:setkeepalive(timeout?, size?)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Puts the current socket's connection immediately into the cosocket built-in connection pool and keep it alive until other [connect](#tcpsockconnect) method calls request it or the associated maximal idle timeout is expired.
 
@@ -8914,7 +8965,7 @@ tcpsock:getreusedtimes
 
 **syntax:** *count, err = tcpsock:getreusedtimes()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 This method returns the (successfully) reused times for the current connection. In case of error, it returns `nil` and a string describing the error.
 
@@ -8931,7 +8982,7 @@ ngx.socket.connect
 
 **syntax:** *tcpsock, err = ngx.socket.connect("unix:/path/to/unix-domain.socket")*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;*
 
 This function is a shortcut for combining [ngx.socket.tcp()](#ngxsockettcp) and the [connect()](#tcpsockconnect) method call in a single operation. It is actually implemented like this:
 
@@ -9002,7 +9053,7 @@ ngx.thread.spawn
 
 **syntax:** *co = ngx.thread.spawn(func, arg1, arg2, ...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Spawns a new user "light thread" with the Lua function `func` as well as those optional arguments `arg1`, `arg2`, and etc. Returns a Lua thread (or Lua coroutine) object represents this "light thread".
 
@@ -9141,7 +9192,7 @@ ngx.thread.wait
 
 **syntax:** *ok, res1, res2, ... = ngx.thread.wait(thread1, thread2, ...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Waits on one or more child "light threads" and returns the results of the first "light thread" that terminates (either successfully or with an error).
 
@@ -9245,7 +9296,7 @@ ngx.thread.kill
 
 **syntax:** *ok, err = ngx.thread.kill(thread)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, ngx.timer.&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Kills a running "light thread" created by [ngx.thread.spawn](#ngxthreadspawn). Returns a true value when successful or `nil` and a string describing the error otherwise.
 
@@ -9260,7 +9311,7 @@ ngx.on_abort
 
 **syntax:** *ok, err = ngx.on_abort(callback)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Registers a user Lua function as the callback which gets called automatically when the client closes the (downstream) connection prematurely.
 
@@ -9773,7 +9824,7 @@ coroutine.create
 
 **syntax:** *co = coroutine.create(f)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Creates a user Lua coroutines with a Lua function, and returns a coroutine object.
 
@@ -9790,7 +9841,7 @@ coroutine.resume
 
 **syntax:** *ok, ... = coroutine.resume(co, ...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Resumes the execution of a user Lua coroutine object previously yielded or just created.
 
@@ -9807,7 +9858,7 @@ coroutine.yield
 
 **syntax:** *... = coroutine.yield(...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Yields the execution of the current user Lua coroutine.
 
@@ -9824,7 +9875,7 @@ coroutine.wrap
 
 **syntax:** *co = coroutine.wrap(f)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Similar to the standard Lua [coroutine.wrap](https://www.lua.org/manual/5.1/manual.html#pdf-coroutine.wrap) API, but works in the context of the Lua coroutines created by ngx_lua.
 
@@ -9839,7 +9890,7 @@ coroutine.running
 
 **syntax:** *co = coroutine.running()*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Identical to the standard Lua [coroutine.running](https://www.lua.org/manual/5.1/manual.html#pdf-coroutine.running) API.
 
@@ -9854,7 +9905,7 @@ coroutine.status
 
 **syntax:** *status = coroutine.status(co)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, init_by_lua&#42;, ngx.timer.&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 Identical to the standard Lua [coroutine.status](https://www.lua.org/manual/5.1/manual.html#pdf-coroutine.status) API.
 
@@ -9869,7 +9920,7 @@ ngx.run_worker_thread
 
 **syntax:** *ok, res1, res2, ... = ngx.run_worker_thread(threadpool, module_name, func_name, arg1, arg2, ...)*
 
-**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 **This API is still experimental and may change in the future without notice.**
 
