@@ -210,7 +210,7 @@ attempt to send data on a closed socket:
         content_by_lua '
             local sock = ngx.socket.tcp()
             local port = $TEST_NGINX_SERVER_PORT
-            local ok, err = sock:connect("localhost", port)
+            local ok, err = sock:connect("127.0.0.1.sslip.io", port)
             if not ok then
                 ngx.say("failed to connect: ", err)
                 return
@@ -218,7 +218,7 @@ attempt to send data on a closed socket:
 
             ngx.say("connected: ", ok)
 
-            local req = "GET /foo HTTP/1.0\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n"
+            local req = "GET /foo HTTP/1.0\\r\\nHost: 127.0.0.1.sslip.io\\r\\nConnection: close\\r\\n\\r\\n"
             -- req = "OK"
 
             local bytes, err = sock:send(req)
@@ -256,7 +256,7 @@ attempt to send data on a closed socket:
 GET /t
 --- response_body_like
 connected: 1
-request sent: 57
+request sent: 66
 first line received: HTTP\/1\.1 200 OK
 second line received: (?:Date|Server): .*?
 --- no_error_log
