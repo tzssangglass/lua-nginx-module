@@ -125,19 +125,11 @@ ngx_http_lua_init_worker_toggle_accept(ngx_cycle_t *cycle, ngx_uint_t arm)
 
     for (i = 0; i < cycle->listening.nelts; i++) {
 
-        /* only toggle plain HTTP TCP listeners; stream/mail/QUIC sockets
-         * must stay armed (QUIC: pre-1.25 uses a non-HTTP handler, newer
-         * versions set ls[i].quic) */
-#if (nginx_version >= 1025000)
-        if (ls[i].handler != ngx_http_init_connection || ls[i].quic) {
-            continue;
-        }
-#else
-        if (ls[i].handler != ngx_http_init_connection) {
-            continue;
-        }
-#endif
-
+        /* disarm every listener, not just HTTP ones: any pending
+         * connection on an armed level-triggered listen fd would make the
+         * pump spin at 100% CPU, and re-arming is faithful for all
+         * subsystems since nginx arms all listeners via the same
+         * subsystem-independent path in ngx_event.c */
 #if (NGX_HAVE_REUSEPORT)
         if (ls[i].reuseport && ls[i].worker != ngx_worker) {
             /* other workers' sockets: ls[i].connection is NULL here */
