@@ -1682,6 +1682,8 @@ Starting from this version, cosocket operations (e.g. `ngx.socket.tcp`, `ngx.soc
 
 Note that `ngx.timer.at` callbacks registered during this hook are deferred: they will not run until the init code finishes. This preserves the implicit ordering guarantee that timer callbacks registered in `init_worker_by_lua*` execute only after the init code completes.
 
+Note that the error log prefix for a runtime error in this context has changed: it is now `lua entry thread aborted:` (followed by a full Lua traceback), whereas before this release it was `init_worker_by_lua error:`. Alert rules that match the old string must be updated. Compile-time error messages are unchanged.
+
 [Back to TOC](#directives)
 
 init_worker_by_lua_file
@@ -3596,6 +3598,8 @@ lua_init_worker_timeout
 
 Sets the maximum wall-clock time that `init_worker_by_lua*` code is allowed to block worker startup. When the timeout is reached, the Lua code is forcibly aborted and the worker continues starting normally (the error is logged at the `ERR` level).
 
+When the timeout is reached, the running chunk coroutine is killed without being unwound. Consequently, an `ngx.timer.at` callback that captures locals of the `init_worker_by_lua*` chunk will read `nil` for those upvalues when the callback runs later. To access configuration or shared data from such a callback, use `ngx.shared`, `_G`, or the Lua registry directly instead of closing over chunk locals.
+
 The default value `0` means no timeout: a hung remote connection will block the worker indefinitely.
 
 The `<time>` argument can be an integer with an optional time unit, like `s` (second) or `ms` (millisecond). The default time unit is `s`. **Note: a bare number means seconds** — to specify milliseconds, you must write the `ms` suffix (e.g. `500ms`).
@@ -3621,7 +3625,7 @@ Note the following limitations:
 
 * This only covers errors that occur **before the first yield** (i.e. synchronous errors). Errors during a yielded cosocket operation are logged but do not trigger the abort.
 * When `on` is set, `exit_worker_by_lua*` is **not executed** — the worker exits via `exit(2)`, which bypasses the graceful shutdown hooks.
-* This directive cannot replace `lua_init_worker_timeout`: it only handles Lua runtime errors, not hung I/O operations.
+* This directive also covers a `lua_init_worker_timeout` expiry: with a bounded timeout and `on`, the worker exits with code 2 when the init code times out. Without a timeout, a hung I/O operation is never interrupted, so this directive cannot by itself bound a hung backend.
 * If the error is reproducible, setting `on` will cause a crash loop (the master keeps restarting a worker that immediately errors out).
 
 This directive was first introduced in this release.
@@ -4606,7 +4610,7 @@ ngx.location.capture
 
 **syntax:** *res = ngx.location.capture(uri, options?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Issues a synchronous but still non-blocking *Nginx Subrequest* using `uri`.
 
@@ -4928,7 +4932,7 @@ ngx.location.capture_multi
 
 **syntax:** *res1, res2, ... = ngx.location.capture_multi({ {uri, options?}, {uri, options?}, ... })*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Just like [ngx.location.capture](#ngxlocationcapture), but supports multiple subrequests running in parallel.
 
@@ -5020,7 +5024,7 @@ ngx.header.HEADER
 
 **syntax:** *value = ngx.header.HEADER*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
 
 Set, add to, or clear the current request's `HEADER` response header that is to be sent.
 
@@ -5568,7 +5572,7 @@ ngx.req.get_post_args
 
 **syntax:** *args, err = ngx.req.get_post_args(max_args?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, body_filter_by_lua&#42;, log_by_lua&#42;*
 
 Returns a Lua table holding all the current request POST query arguments (of the MIME type `application/x-www-form-urlencoded`). Call [ngx.req.read_body](#ngxreqread_body) to read the request body first or turn on the [lua_need_request_body](#lua_need_request_body) directive to avoid errors.
 
@@ -5836,7 +5840,7 @@ ngx.req.read_body
 
 **syntax:** *ngx.req.read_body()*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Reads the client request body synchronously without blocking the Nginx event loop.
 
@@ -5868,7 +5872,7 @@ ngx.req.discard_body
 
 **syntax:** *ngx.req.discard_body()*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly discard the request body, i.e., read the data on the connection and throw it away immediately (without using the request body by any means).
 
@@ -5887,7 +5891,7 @@ ngx.req.get_body_data
 
 **syntax:** *data = ngx.req.get_body_data(max_bytes?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, log_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, log_by_lua&#42;*
 
 Retrieves in-memory request body data. It returns a Lua string rather than a Lua table holding all the parsed query arguments. Use the [ngx.req.get_post_args](#ngxreqget_post_args) function instead if a Lua table is required.
 
@@ -5918,7 +5922,7 @@ ngx.req.get_body_file
 
 **syntax:** *file_name = ngx.req.get_body_file()*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Retrieves the file name for the in-file request body data. Returns `nil` if the request body has not been read or has been read into memory.
 
@@ -5943,7 +5947,7 @@ ngx.req.set_body_data
 
 **syntax:** *ngx.req.set_body_data(data)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
 
 Set the current request's request body using the in-memory data specified by the `data` argument.
 
@@ -5964,7 +5968,7 @@ ngx.req.set_body_file
 
 **syntax:** *ngx.req.set_body_file(file_name, auto_clean?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, balancer_by_lua&#42;,*
 
 Set the current request's request body using the in-file data specified by the `file_name` argument.
 
@@ -6059,7 +6063,7 @@ ngx.req.socket
 
 **syntax:** *tcpsock, err = ngx.req.socket(raw)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Returns a read-only cosocket object that wraps the downstream connection. Only [receive](#tcpsockreceive), [receiveany](#tcpsockreceiveany) and [receiveuntil](#tcpsockreceiveuntil) methods are supported on this object.
 
@@ -6087,7 +6091,7 @@ ngx.exec
 
 **syntax:** *ngx.exec(uri, args?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Does an internal redirect to `uri` with `args` and is similar to the [echo_exec](http://github.com/openresty/echo-nginx-module#echo_exec) directive of the [echo-nginx-module](http://github.com/openresty/echo-nginx-module).
 
@@ -6155,7 +6159,7 @@ ngx.redirect
 
 **syntax:** *ngx.redirect(uri, status?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Issue an `HTTP 301` or `302` redirection to `uri`.
 
@@ -6248,7 +6252,7 @@ ngx.send_headers
 
 **syntax:** *ok, err = ngx.send_headers()*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly send out the response headers.
 
@@ -6277,7 +6281,7 @@ ngx.print
 
 **syntax:** *ok, err = ngx.print(...)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Emits arguments concatenated to the HTTP client (as response body). If response headers have not been sent, this function will send headers out first and then output body data.
 
@@ -6319,7 +6323,7 @@ ngx.say
 
 **syntax:** *ok, err = ngx.say(...)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Just as [ngx.print](#ngxprint) but also emit a trailing newline.
 
@@ -6347,7 +6351,7 @@ ngx.flush
 
 **syntax:** *ok, err = ngx.flush(wait?)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Flushes response output to the client.
 
@@ -6368,7 +6372,7 @@ ngx.exit
 
 **syntax:** *ngx.exit(status)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, ngx.timer.&#42;, balancer_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;, header_filter_by_lua&#42;, ngx.timer.&#42;, balancer_by_lua&#42;, ssl_certificate_by_lua&#42;, ssl_session_fetch_by_lua&#42;, ssl_session_store_by_lua&#42;, ssl_client_hello_by_lua&#42;*
 
 When `status >= 200` (i.e., `ngx.HTTP_OK` and above), it will interrupt the execution of the current request and return status code to Nginx.
 
@@ -6424,7 +6428,7 @@ ngx.eof
 
 **syntax:** *ok, err = ngx.eof()*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Explicitly specify the end of the response output stream. In the case of HTTP 1.1 chunked encoded output, it will just trigger the Nginx core to send out the "last chunk".
 
@@ -9311,7 +9315,7 @@ ngx.on_abort
 
 **syntax:** *ok, err = ngx.on_abort(callback)*
 
-**context:** *init_worker_by_lua&#42;, rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
+**context:** *rewrite_by_lua&#42;, access_by_lua&#42;, content_by_lua&#42;*
 
 Registers a user Lua function as the callback which gets called automatically when the client closes the (downstream) connection prematurely.
 

@@ -73,7 +73,7 @@ ngx_http_lua_init_worker_pump(ngx_cycle_t *cycle, ngx_msec_t budget)
 
     if (!ngx_queue_empty(&ngx_posted_next_events)) {
         ngx_event_move_posted_next(cycle);
-       timer = 0;
+        timer = 0;
     }
 
 #ifdef HAVE_POSTED_DELAYED_EVENTS_PATCH
@@ -124,6 +124,19 @@ ngx_http_lua_init_worker_toggle_accept(ngx_cycle_t *cycle, ngx_uint_t arm)
     ls = cycle->listening.elts;
 
     for (i = 0; i < cycle->listening.nelts; i++) {
+
+        /* only toggle plain HTTP TCP listeners; stream/mail/QUIC sockets
+         * must stay armed (QUIC: pre-1.25 uses a non-HTTP handler, newer
+         * versions set ls[i].quic) */
+#if (nginx_version >= 1025000)
+        if (ls[i].handler != ngx_http_init_connection || ls[i].quic) {
+            continue;
+        }
+#else
+        if (ls[i].handler != ngx_http_init_connection) {
+            continue;
+        }
+#endif
 
 #if (NGX_HAVE_REUSEPORT)
         if (ls[i].reuseport && ls[i].worker != ngx_worker) {
